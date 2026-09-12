@@ -95,6 +95,13 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   sequence still counts as one sequence that contributes 0. GSPO is sequence-level and takes no
   `loss_agg_mode`. `UnifiedModelTrainStack` weights micro-batches by sample share only, so its
   `token-mean` is not a global token mean.
+- **`DiffusionTeacherProvider` contract, lifecycle, and isolation** — `DiffusionOPD`
+  delegates teacher replay to a `DiffusionTeacherProvider`. Replay always runs under
+  `torch.no_grad()` and returns detached means `[B, S', *latent]`, never leaking teacher
+  gradients or entering the student optimizer/checkpoint (`assert_isolation`).
+  `FullModelTeacherProvider` provides explicit device placement and CPU offload/wake
+  management (`offload_to_cpu: true`); its `teardown_on_failure` contract ensures any
+  associated remote role or pinned GPU memory is cleaned up if replay raises.
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
