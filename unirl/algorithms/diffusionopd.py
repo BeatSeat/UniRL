@@ -56,6 +56,10 @@ class DiffusionTeacherProvider(ABC):
     ) -> torch.Tensor:
         """Replay teacher on student trajectory; returns detached means [B, S', *latent]."""
 
+    def resolve_domain(self, domain: Optional[str] = None) -> Optional[str]:
+        """Resolve the effective domain name, defaulting for single-teacher setups."""
+        return domain or self.name
+
     def wake(self) -> None:
         """Wake or onload the teacher to the execution device."""
 
@@ -101,6 +105,59 @@ class FrozenLoraTeacherProvider(DiffusionTeacherProvider):
                 f"(present: {sorted(present)}). Declare them under backend.lora_cfg.frozen_adapters."
             )
 
+    @classmethod
+    def from_specs(
+        cls,
+        *,
+        stage: Any,
+        backend: Any,
+        teachers: Any,
+        conditions_cls: Optional[Type[Any]] = None,
+    ) -> FrozenLoraTeacherProvider:
+        """Construct a frozen LoRA teacher provider from configuration specs."""
+        model = getattr(backend, "model", None) if backend is not None else None
+        if model is None:
+            raise ValueError(
+                "DiffusionOPD: no `backend` was injected — the default frozen-LoRA teacher "
+                "provider requires the trainable model. The v2 DiffusionTrainer injects it when the "
+                "algorithm declares requires_backend=True."
+            )
+        teacher_dict: Dict[str, TeacherSpec] = {}
+        for entry in teachers or []:
+            if isinstance(entry, TeacherSpec):
+                spec = entry
+            else:
+                get = entry.get if hasattr(entry, "get") else lambda k, d=None: getattr(entry, k, d)
+                name = get("name")
+                if not name:
+                    raise ValueError(f"DiffusionOPD: every teacher entry needs a 'name'; got {entry!r}.")
+                gs = get("guidance_scale")
+                spec = TeacherSpec(name=str(name), guidance_scale=None if gs is None else float(gs))
+            if spec.name in teacher_dict:
+                raise ValueError(f"DiffusionOPD: duplicate teacher name {spec.name!r}.")
+            teacher_dict[spec.name] = spec
+        if not teacher_dict:
+            raise ValueError("DiffusionOPD: at least one teacher or a teacher_provider is required.")
+
+        return cls(
+            stage=stage,
+            model=model,
+            teachers=teacher_dict,
+            conditions_cls=conditions_cls,
+        )
+
+    def resolve_domain(self, domain: Optional[str] = None) -> str:
+        """Resolve domain or default to the unique configured teacher."""
+        if domain is not None:
+            return domain
+        if len(self.teachers) == 1:
+            return next(iter(self.teachers))
+        raise RuntimeError(
+            f"DiffusionOPD.prepare_part: no per-row metadata[{DOMAIN_KEY!r}] on the train Part. "
+            "Use a domain-stamping data source (MultiDomainRLDataSource) — the trainer "
+            "projects root metadata onto the train Part automatically."
+        )
+
     def replay(
         self,
         conditions: Any,
@@ -111,15 +168,11 @@ class FrozenLoraTeacherProvider(DiffusionTeacherProvider):
         domain: Optional[str] = None,
     ) -> torch.Tensor:
         """Replay teacher with active frozen adapter and return detached means [B, S', *latent]."""
-        if domain is None:
-            if len(self.teachers) == 1:
-                domain = next(iter(self.teachers))
-            else:
-                raise RuntimeError("FrozenLoraTeacherProvider: domain is required for multi-teacher setup.")
-        teacher = self.teachers.get(domain)
+        resolved_domain = self.resolve_domain(domain)
+        teacher = self.teachers.get(resolved_domain)
         if teacher is None:
             raise RuntimeError(
-                f"FrozenLoraTeacherProvider.replay: batch domain {domain!r} has no configured teacher "
+                f"FrozenLoraTeacherProvider.replay: batch domain {resolved_domain!r} has no configured teacher "
                 f"(teachers: {sorted(self.teachers)})."
             )
         teacher_params = params
@@ -199,23 +252,20 @@ class FullModelTeacherProvider(DiffusionTeacherProvider):
                 raise ValueError("FullModelTeacherProvider: an explicit stage must own its teacher model.")
             if model is not None and model is not stage_model:
                 raise ValueError("FullModelTeacherProvider: model must be the same object as stage.model.")
-            model = stage_model
-        self._model = model
+            self._model = stage_model
+        else:
+            self._model = model
 
         if device is None:
-            if model is not None and hasattr(model, "device"):
-                self.device = torch.device(model.device)
-            elif torch.cuda.is_available():
-                self.device = torch.device("cuda")
-            else:
-                self.device = torch.device("cpu")
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
 
-        self._freeze_parameters()
-
         self.offload_to_cpu = bool(offload_to_cpu)
         self._is_awake = not self.offload_to_cpu
+
+        self._freeze_parameters()
+
         if self.offload_to_cpu:
             self._to_device(torch.device("cpu"))
         elif self._model is not None:
@@ -250,7 +300,7 @@ class FullModelTeacherProvider(DiffusionTeacherProvider):
         if self.dtype is not None:
             to_kwargs["dtype"] = self.dtype
         module.to(**to_kwargs)
-        if not isinstance(self._model, nn.Module) and hasattr(self._model, "device"):
+        if hasattr(self._model, "device"):
             self._model.device = target_device
 
     def setup(self, *, stage: Any = None, conditions_cls: Optional[Type[Any]] = None) -> None:
@@ -268,16 +318,12 @@ class FullModelTeacherProvider(DiffusionTeacherProvider):
 
     def wake(self) -> None:
         """Wake or onload the teacher to the execution device."""
-        if self.role is not None and hasattr(self.role, "wake_up"):
-            self.role.wake_up()
         if self.offload_to_cpu and not self._is_awake:
             self._to_device(self.device)
             self._is_awake = True
 
     def offload(self) -> None:
         """Offload the teacher to CPU or sleep mode."""
-        if self.role is not None and hasattr(self.role, "sleep"):
-            self.role.sleep()
         if self.offload_to_cpu and self._is_awake:
             self._to_device(torch.device("cpu"))
             if torch.cuda.is_available() and self.device.type == "cuda":
@@ -288,25 +334,13 @@ class FullModelTeacherProvider(DiffusionTeacherProvider):
         """Release teacher resources, terminate roles, and reclaim memory."""
         errors: List[tuple[str, BaseException]] = []
         if self.role is not None:
-            found_cleanup = False
-            role_errors: List[tuple[str, BaseException]] = []
-            for method in ("teardown", "shutdown", "stop"):
-                cleanup = getattr(self.role, method, None)
-                if not callable(cleanup):
-                    continue
-                found_cleanup = True
+            cleanup = getattr(self.role, "teardown", None) or getattr(self.role, "shutdown", None)
+            if callable(cleanup):
                 try:
                     cleanup()
                 except BaseException as exc:
-                    role_errors.append((f"role.{method}", exc))
-                    continue
-                else:
-                    self.role = None
-                    break
-            if not found_cleanup:
-                self.role = None
-            elif self.role is not None:
-                errors.extend(role_errors)
+                    errors.append(("role cleanup", exc))
+            self.role = None
         try:
             if self.offload_to_cpu or self._is_awake:
                 self._to_device(torch.device("cpu"))
@@ -337,13 +371,11 @@ class FullModelTeacherProvider(DiffusionTeacherProvider):
             return
         if student_model is not None:
             student_param_ids = {id(p) for p in student_model.parameters()}
-            leaked = teacher_param_ids & student_param_ids
-            if leaked:
+            if teacher_param_ids & student_param_ids:
                 raise ValueError("FullModelTeacherProvider: teacher parameters leaked into student model parameters.")
         if optimizer is not None:
             opt_p_ids = {id(p) for group in optimizer.param_groups for p in group.get("params", [])}
-            leaked = teacher_param_ids & opt_p_ids
-            if leaked:
+            if teacher_param_ids & opt_p_ids:
                 raise ValueError("FullModelTeacherProvider: teacher parameters leaked into student optimizer groups.")
 
     def replay(
@@ -356,28 +388,20 @@ class FullModelTeacherProvider(DiffusionTeacherProvider):
         domain: Optional[str] = None,
     ) -> torch.Tensor:
         """Replay full-model teacher on student trajectory; returns detached means [B, S', *latent]."""
-        if self.stage is None and (self.role is None or not hasattr(self.role, "replay")):
-            raise RuntimeError("FullModelTeacherProvider: neither `stage` nor a runnable `role` is configured.")
+        if self.stage is None:
+            raise RuntimeError("FullModelTeacherProvider: `stage` is not configured.")
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         teacher_params = params
         if self.guidance_scale is not None:
             teacher_params = dataclasses.replace(params, guidance_scale=self.guidance_scale)
 
         with torch.no_grad():
-            if self.role is not None and hasattr(self.role, "replay"):
-                result = self.role.replay(
-                    typed_conds,
-                    segment=segment,
-                    params=teacher_params,
-                    step_indices=step_indices,
-                )
-            else:
-                result = self.stage.replay(
-                    typed_conds,
-                    segment=segment,
-                    params=teacher_params,
-                    step_indices=step_indices,
-                )
+            result = self.stage.replay(
+                typed_conds,
+                segment=segment,
+                params=teacher_params,
+                step_indices=step_indices,
+            )
         if result.prev_sample_means is None:
             raise RuntimeError("FullModelTeacherProvider: stage.replay() returned prev_sample_means=None.")
         return result.prev_sample_means.detach()
@@ -428,46 +452,19 @@ class DiffusionOPD(StageAlgorithm):
         self._model = model
 
         if teacher_provider is not None:
-            if not isinstance(teacher_provider, DiffusionTeacherProvider):
-                raise TypeError(
-                    f"DiffusionOPD: teacher_provider must be an instance of DiffusionTeacherProvider, "
-                    f"got {type(teacher_provider)}."
-                )
             self.teacher_provider = teacher_provider
             self.teacher_provider.setup(stage=self.stage, conditions_cls=self.conditions_cls)
             self.teacher_provider.assert_isolation(student_model=self._model, optimizer=optimizer)
             self.teachers = {}
         else:
-            if model is None:
-                raise ValueError(
-                    "DiffusionOPD: no `backend` was injected — the default frozen-LoRA teacher "
-                    "provider requires the trainable model. The v2 DiffusionTrainer injects it when the "
-                    "algorithm declares requires_backend=True."
-                )
-            self.teachers = {}
-            for entry in teachers or []:
-                if isinstance(entry, TeacherSpec):
-                    spec = entry
-                else:
-                    get = entry.get if hasattr(entry, "get") else lambda k, d=None: getattr(entry, k, d)
-                    name = get("name")
-                    if not name:
-                        raise ValueError(f"DiffusionOPD: every teacher entry needs a 'name'; got {entry!r}.")
-                    gs = get("guidance_scale")
-                    spec = TeacherSpec(name=str(name), guidance_scale=None if gs is None else float(gs))
-                if spec.name in self.teachers:
-                    raise ValueError(f"DiffusionOPD: duplicate teacher name {spec.name!r}.")
-                self.teachers[spec.name] = spec
-            if not self.teachers:
-                raise ValueError("DiffusionOPD: at least one teacher or a teacher_provider is required.")
-
-            self.teacher_provider = FrozenLoraTeacherProvider(
+            self.teacher_provider = FrozenLoraTeacherProvider.from_specs(
                 stage=self.stage,
-                model=self._model,
-                teachers=self.teachers,
+                backend=backend,
+                teachers=teachers,
                 conditions_cls=self.conditions_cls,
             )
             self.teacher_provider.assert_isolation(student_model=self._model, optimizer=optimizer)
+            self.teachers = self.teacher_provider.teachers
 
         # Set by prepare_part for the per-teacher loss metric of the current rollout.
         self._active_teacher: Optional[str] = None
@@ -504,14 +501,8 @@ class DiffusionOPD(StageAlgorithm):
                     "each rollout batch must be single-domain (one teacher per batch)."
                 )
             domain = str(next(iter(domains)))
-        elif isinstance(self.teacher_provider, FrozenLoraTeacherProvider):
-            if len(self.teacher_provider.teachers) != 1:
-                raise RuntimeError(
-                    "DiffusionOPD.prepare_part: no per-row metadata[{key!r}] on the train Part. "
-                    "Use a domain-stamping data source (MultiDomainRLDataSource) — the trainer "
-                    "projects root metadata onto the train Part automatically.".format(key=DOMAIN_KEY)
-                )
-            domain = next(iter(self.teacher_provider.teachers))
+
+        domain = self.teacher_provider.resolve_domain(domain)
 
         try:
             self.teacher_provider.wake()
