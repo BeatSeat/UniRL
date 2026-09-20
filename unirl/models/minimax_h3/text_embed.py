@@ -12,7 +12,7 @@ from collections import OrderedDict
 from contextlib import ExitStack, contextmanager
 from datetime import timedelta
 from functools import cache
-from typing import TYPE_CHECKING, Iterator, List
+from typing import TYPE_CHECKING, Any, Iterator, List
 
 import torch
 
@@ -22,6 +22,29 @@ from unirl.types.primitives import Texts
 from unirl.utils.run_id import resolve_run_id
 
 from .vendor import MINIMAX_H3_TEXT_ENCODER_LAYER
+
+
+def encode_minimax_h3_prompt(
+    *,
+    text_encoder: torch.nn.Module,
+    tokenizer: Any,
+    processor: Any,
+    prompt: str,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return layer-50 hidden states ``[1, L, D]`` for one prompt."""
+    token_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
+    mm_token_type_ids = torch.tensor(processor.create_mm_token_type_ids([token_ids]), dtype=torch.long, device=device)
+    outputs = text_encoder.model(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        mm_token_type_ids=mm_token_type_ids,
+        use_cache=False,
+        output_hidden_states=True,
+    )
+    return outputs.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER]
+
 
 if TYPE_CHECKING:
     from .bundle import MiniMaxH3Bundle
@@ -68,6 +91,7 @@ class MiniMaxH3TextEmbedStage:
         self.device = bundle.device
         self.vae = bundle.vae
         self.audio_vae = bundle.audio_vae
+        self._store = bundle.text_embed_store
         self._onload_for_embed = bundle.text_encoder_onload_for_embed
         # The encoder is frozen and prompt-only. Trainside forward_batch_size=1
         # invokes pipeline.generate once per sibling sample, so cache on CPU to
@@ -77,13 +101,29 @@ class MiniMaxH3TextEmbedStage:
 
     @property
     def _encoder_device(self) -> torch.device:
+        require(self.text_encoder is not None, "MiniMaxH3TextEmbedStage: text_encoder is not loaded")
         return next(self.text_encoder.parameters()).device
 
     @property
     def _decoder(self):
         """The decoder stack that owns ``.layers``."""
+        require(self.text_encoder is not None, "MiniMaxH3TextEmbedStage: text_encoder is not loaded")
         model = self.text_encoder.model
         return getattr(model, "language_model", model)
+
+    def _pack_embeds(self, embeds: List[torch.Tensor]) -> TextEmbedCondition:
+        lengths = {int(tensor.shape[1]) for tensor in embeds}
+        require(
+            len(lengths) == 1,
+            f"MiniMaxH3TextEmbedStage: prompts tokenized to differing lengths {sorted(lengths)}. The packed sequence "
+            f"geometry must be identical across the batch (LatentSegment stores latents in a CONCAT field), so a "
+            f"mixed-length batch cannot be packed. Pad or group prompts by token length upstream.",
+        )
+        stacked = torch.cat(embeds, dim=0)
+        return TextEmbedCondition(
+            embeds=stacked,
+            attn_mask=torch.ones(stacked.shape[:2], dtype=torch.bool, device=stacked.device),
+        )
 
     @torch.no_grad()
     def embed(self, texts: Texts) -> TextEmbedCondition:
@@ -93,6 +133,17 @@ class MiniMaxH3TextEmbedStage:
         # accessor ltx2 and wan21 use.
         prompts: List[str] = list(texts.texts)
         require(len(prompts) > 0, "MiniMaxH3TextEmbedStage: no prompts to embed")
+        if self._store is not None:
+            pieces = []
+            for prompt in prompts:
+                embeds = self._store.get(prompt).embeds
+                require(embeds is not None, f"MiniMaxH3TextEmbedStage: empty cache entry for {prompt!r}")
+                pieces.append(embeds.to(device=self.device, dtype=self.dtype))
+            return self._pack_embeds(pieces)
+        require(
+            self.text_encoder is not None,
+            "MiniMaxH3TextEmbedStage: text_encoder is not loaded and text_embed_cache_path is unset.",
+        )
 
         num_layers = len(self._decoder.layers)
         require(
@@ -128,20 +179,7 @@ class MiniMaxH3TextEmbedStage:
             self._onload_for_embed,
             time.perf_counter() - started,
         )
-        embeds = [resolved[prompt].to(device=self.device, dtype=self.dtype) for prompt in prompts]
-
-        lengths = {int(e.shape[1]) for e in embeds}
-        require(
-            len(lengths) == 1,
-            f"MiniMaxH3TextEmbedStage: prompts tokenized to differing lengths {sorted(lengths)}. The packed sequence "
-            f"geometry must be identical across the batch (LatentSegment stores latents in a CONCAT field), so a "
-            f"mixed-length batch cannot be packed. Pad or group prompts by token length upstream.",
-        )
-        text_embeds = torch.cat(embeds, dim=0)
-        return TextEmbedCondition(
-            embeds=text_embeds,
-            attn_mask=torch.ones(text_embeds.shape[:2], dtype=torch.bool, device=text_embeds.device),
-        )
+        return self._pack_embeds([resolved[prompt].to(device=self.device, dtype=self.dtype) for prompt in prompts])
 
     def _ensure_embedding_sync_group(self) -> None:
         """Build the barrier group while the ranks are still in lockstep."""
@@ -174,22 +212,13 @@ class MiniMaxH3TextEmbedStage:
 
     def _encode_prompt(self, prompt: str, encoder_device: torch.device) -> torch.Tensor:
         """Run the frozen Qwen3-VL conditioner once for one prompt."""
-        token_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=encoder_device)
-        # Qwen3-VL lays its 3D rotary positions out per modality run, read
-        # off the token type ids the processor derives (0 text, 1 image,
-        # 2 video). Text-only here, but the conditioner still wants them.
-        mm_token_type_ids = torch.tensor(
-            self.processor.create_mm_token_type_ids([token_ids]), dtype=torch.long, device=encoder_device
+        return encode_minimax_h3_prompt(
+            text_encoder=self.text_encoder,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            prompt=prompt,
+            device=encoder_device,
         )
-        outputs = self.text_encoder.model(
-            input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids),
-            mm_token_type_ids=mm_token_type_ids,
-            use_cache=False,
-            output_hidden_states=True,
-        )
-        return outputs.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER]
 
     @contextmanager
     def _embedding_residency(self) -> Iterator[None]:
@@ -220,4 +249,4 @@ class MiniMaxH3TextEmbedStage:
             yield
 
 
-__all__ = ["MiniMaxH3TextEmbedStage"]
+__all__ = ["MiniMaxH3TextEmbedStage", "encode_minimax_h3_prompt"]

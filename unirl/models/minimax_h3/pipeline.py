@@ -8,6 +8,7 @@ from unirl.config.require import require
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import StepStrategy
 from unirl.sde.runtime import FlowMatchSchedulePolicy
+from unirl.types.conditions import TextEmbedCondition
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
@@ -113,10 +114,8 @@ class MiniMaxH3Pipeline(Pipeline):
 
         conditioning = list(sample.conditioning())
         texts = next((c for c in conditioning if isinstance(c, Texts)), None)
-        require(texts is not None, "MiniMaxH3Pipeline.generate: no text prompt in the sample conditioning")
-
         geometry = MiniMaxH3Geometry.from_params(params)
-        conditions = MiniMaxH3Conditions(text=self.text_embed.embed(texts))
+        conditions = MiniMaxH3Conditions(text=self._text_condition(sample, texts))
 
         # Driver-authoritative x_T. MiniMax-H3 draws VIDEO noise first, then
         # audio, off the one request generator -- the ``salt`` sibling
@@ -171,6 +170,20 @@ class MiniMaxH3Pipeline(Pipeline):
         # generate() hands back, so the whole Sample has to come back out.
         # Same shape as sd3 / wan21 / ltx2.
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
+
+    def _text_condition(self, sample: Sample, texts: Texts | None) -> TextEmbedCondition:
+        """Prefer a carried embed; otherwise encode or look up via ``text_embed``."""
+        for part in reversed(sample.parts):
+            cond = part.conditions.get("text")
+            if isinstance(cond, TextEmbedCondition) and cond.embeds is not None:
+                mask = None if cond.attn_mask is None else cond.attn_mask.to(device=self.bundle.device)
+                return TextEmbedCondition(
+                    embeds=cond.embeds.to(device=self.bundle.device, dtype=self.bundle.dtype),
+                    pooled=cond.pooled,
+                    attn_mask=mask,
+                )
+        require(texts is not None, "MiniMaxH3Pipeline.generate: no text prompt in the sample conditioning")
+        return self.text_embed.embed(texts)
 
 
 __all__ = ["MiniMaxH3Pipeline"]
