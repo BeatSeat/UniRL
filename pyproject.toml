@@ -41,10 +41,9 @@ dependencies = [
   "tensordict>=0.5",
 ]
 
-# Parent/inline engines load this. Multi-stage StageDiffusionProc does not —
-# VLLMOmniHijack.hijack() reinstalls the same hook in spawn children.
+# vllm-omni 0.28 loads this in parent and spawned stage processes.
 [project.entry-points."vllm_omni.general_plugins"]
-unirl_capture_flush = "unirl.rollout.engine.vllm_omni.plugin:register_capture_flush"
+unirl_runtime = "unirl.rollout.engine.vllm_omni.plugin:register_unirl_runtime"
 
 [project.optional-dependencies]
 # sglang pinned to the upstream release the UniRL sglang patch package
@@ -83,10 +82,12 @@ sglang = [
 ]
 # CUDA 13: vllm >=0.26 wants a bare `torch==2.13.0` whose wheel is cu130, and a
 # +cu129 pin would resolve anyway, linking a CUDA-12 torch under a CUDA-13 vllm.
-# Prerelease, so installs need --prerelease=allow, plus sglang's compat layer.
 vllm = [
-  "vllm==0.27.0 ; sys_platform == 'linux'",
-  "vllm-omni==0.27.0rc1 ; sys_platform == 'linux'",
+  "vllm==0.28.0 ; sys_platform == 'linux'",
+  "vllm-omni==0.28.0 ; sys_platform == 'linux'",
+  # vllm-omni 0.28 needs >=5.10.1,<5.15 (5.10.0 is yanked, 5.15 has a known
+  # construction regression); exact because there is no uv.lock to hold it.
+  "transformers==5.12.1 ; sys_platform == 'linux'",
   "torch==2.13.0+cu130 ; sys_platform == 'linux'",
   "torchvision==0.28.0+cu130 ; sys_platform == 'linux'",
   # torchaudio is not required directly by the vLLM backend, so this extra
@@ -169,17 +170,14 @@ index-strategy = "unsafe-best-match"
 # transformers 5.12.1 accepts tokenizers<=0.23.0, but tokenizers 0.23.0(rc)
 # dropped the `cls` kwarg from RobertaProcessing.__new__, so deserializing a
 # saved CLIP tokenizer.json raises TypeError at rollout init (the SD3 text
-# encoders, e2e-confirmed on H20). The sglang install's --prerelease=allow flag
-# (see INSTALL.md) otherwise selects 0.23.0rc*; this override outranks it AND
-# guards against 0.23.0 shipping stable. tokenizers 0.22.2 verified on both
-# engine venvs.
+# encoders, e2e-confirmed on H20). Keep both engine stacks on the verified
+# tokenizers 0.22 family.
 override-dependencies = [
   "kernels>=0.14.1,<0.15",
   "tokenizers>=0.22,<0.23",
-  # sglang[diffusion] hard-pins diffusers==0.37.0 (still pinned on sglang main),
-  # colliding with the base diffusers>=0.38.0 floor (#91); override to the floor
-  # so ".[sglang,...]" stays solvable (same tactic as kernels/tokenizers above).
-  "diffusers>=0.38.0",
+  # Override sglang[diffusion]'s stale 0.37 pin with the exact version required
+  # by vllm-omni 0.28.0. Both mutually exclusive engine stacks use this version.
+  "diffusers==0.40.0",
 ]
 environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
