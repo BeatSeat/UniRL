@@ -623,7 +623,7 @@ def patch_sigmas_passthrough() -> None:
 
 
 def patch_diffusion_worker_sleep_cache_clear() -> None:
-    """Clear prompt-embedding cache before DiffusionWorker sleeps to avoid GPU memory leaks."""
+    """Drop cached prompt embeddings before ``DiffusionWorker.sleep`` so they don't stay resident through training."""
     try:
         from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
     except (ImportError, AttributeError):
@@ -634,16 +634,9 @@ def patch_diffusion_worker_sleep_cache_clear() -> None:
         return
 
     def _patched_sleep(self, level: int = 1, *args, _orig=_orig_sleep, **kwargs):
-        runner = getattr(self, "model_runner", None)
-        if runner is not None:
-            cache = getattr(runner, "prompt_embed_cache", None)
-            if cache is not None and callable(getattr(cache, "clear", None)):
-                cache.clear()
-            pipe = getattr(runner, "pipeline", None)
-            if pipe is not None:
-                pipe_cache = getattr(pipe, "_prompt_embed_cache", None)
-                if pipe_cache is not None and callable(getattr(pipe_cache, "clear", None)):
-                    pipe_cache.clear()
+        clear = getattr(getattr(self, "model_runner", None), "clear_prompt_embed_cache", None)
+        if callable(clear):
+            clear()
         return _orig(self, level, *args, **kwargs)
 
     _patched_sleep._unirl_prompt_cache_clear = True  # type: ignore[attr-defined]

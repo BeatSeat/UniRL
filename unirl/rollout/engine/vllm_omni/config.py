@@ -54,6 +54,10 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
             self.modality in valid,
             f"VLLMOmniEngineConfig.modality must be one of {set(valid)}; got {self.modality!r}",
         )
+        require(
+            int(self.prompt_embed_cache_size) >= 1,
+            f"VLLMOmniEngineConfig.prompt_embed_cache_size must be >= 1; got {self.prompt_embed_cache_size!r}",
+        )
 
     def server_intent(
         self,
@@ -84,8 +88,8 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
         if mode is not None:
             omni_kwargs["mode"] = mode
         if self.enable_prompt_embed_cache:
-            omni_kwargs.setdefault("enable_prompt_embed_cache", True)
-            omni_kwargs.setdefault("prompt_embed_cache_size", int(self.prompt_embed_cache_size))
+            omni_kwargs["enable_prompt_embed_cache"] = True
+            omni_kwargs["prompt_embed_cache_size"] = int(self.prompt_embed_cache_size)
         omni_kwargs.update(self.omni_extra or {})
         intent["omni_kwargs"] = omni_kwargs
         return intent
