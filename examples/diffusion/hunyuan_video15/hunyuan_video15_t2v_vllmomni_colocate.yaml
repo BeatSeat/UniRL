@@ -128,6 +128,9 @@ rollout:
     omni_extra:
       init_timeout: 3600
       stage_init_timeout: 1800
+      # Reuse text-encoder outputs across GRPO siblings; size >= distinct prompts in flight per worker.
+      # enable_prompt_embed_cache: true
+      # prompt_embed_cache_size: 32
 
 reward:
   _target_: unirl.reward.service.RewardService
