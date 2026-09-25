@@ -128,8 +128,7 @@ rollout:
     omni_extra:
       init_timeout: 3600
       stage_init_timeout: 1800
-      # Reuse text-encoder outputs across GRPO siblings of the same prompt.
-      # Size must cover the distinct prompts in flight per rollout worker.
+      # Reuse text-encoder outputs across GRPO siblings; size >= distinct prompts in flight per worker.
       # enable_prompt_embed_cache: true
       # prompt_embed_cache_size: 32
 

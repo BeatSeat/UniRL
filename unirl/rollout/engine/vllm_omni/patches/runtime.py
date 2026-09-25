@@ -622,27 +622,6 @@ def patch_sigmas_passthrough() -> None:
         pass
 
 
-def patch_diffusion_worker_sleep_cache_clear() -> None:
-    """Drop cached prompt embeddings before ``DiffusionWorker.sleep`` so they don't stay resident through training."""
-    try:
-        from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
-    except (ImportError, AttributeError):
-        return
-
-    _orig_sleep = getattr(DiffusionWorker, "sleep", None)
-    if _orig_sleep is None or getattr(_orig_sleep, "_unirl_prompt_cache_clear", False):
-        return
-
-    def _patched_sleep(self, level: int = 1, *args, _orig=_orig_sleep, **kwargs):
-        clear = getattr(getattr(self, "model_runner", None), "clear_prompt_embed_cache", None)
-        if callable(clear):
-            clear()
-        return _orig(self, level, *args, **kwargs)
-
-    _patched_sleep._unirl_prompt_cache_clear = True  # type: ignore[attr-defined]
-    DiffusionWorker.sleep = _patched_sleep
-
-
 class VLLMOmniHijack:
     """Monkey-patches vllm-omni internals to support in-memory LoRA tensors."""
 
@@ -660,13 +639,11 @@ class VLLMOmniHijack:
         patch_lora_request_passthrough()
         patch_sigmas_passthrough()
         patch_moe_workspace_pool()
-        patch_diffusion_worker_sleep_cache_clear()
 
 
 __all__ = [
     "OmniTensorLoRARequest",
     "VLLMOmniHijack",
-    "patch_diffusion_worker_sleep_cache_clear",
     "patch_hv15_packed_lora_mapping",
     "patch_hv15_refiner_torch_linear_lora",
     "patch_sigmas_passthrough",
