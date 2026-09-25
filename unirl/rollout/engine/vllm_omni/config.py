@@ -42,9 +42,6 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
     use_audio_in_video: Optional[bool] = None
     chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
 
-    enable_prompt_embed_cache: bool = False
-    prompt_embed_cache_size: int = 32
-
     def __post_init__(self) -> None:
         self.modality = str(self.modality or "").strip().lower()
         from unirl.rollout.engine.vllm_omni.adapters import registered_adapters
@@ -53,10 +50,6 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
         require(
             self.modality in valid,
             f"VLLMOmniEngineConfig.modality must be one of {set(valid)}; got {self.modality!r}",
-        )
-        require(
-            int(self.prompt_embed_cache_size) >= 1,
-            f"VLLMOmniEngineConfig.prompt_embed_cache_size must be >= 1; got {self.prompt_embed_cache_size!r}",
         )
 
     def server_intent(
@@ -87,9 +80,6 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
         )
         if mode is not None:
             omni_kwargs["mode"] = mode
-        if self.enable_prompt_embed_cache:
-            omni_kwargs["enable_prompt_embed_cache"] = True
-            omni_kwargs["prompt_embed_cache_size"] = int(self.prompt_embed_cache_size)
         omni_kwargs.update(self.omni_extra or {})
         intent["omni_kwargs"] = omni_kwargs
         return intent
