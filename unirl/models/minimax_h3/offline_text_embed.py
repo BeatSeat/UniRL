@@ -72,9 +72,6 @@ class OfflineTextEmbedStore:
         logger.info("Loaded MiniMax-H3 text-embed store from %s (%d prompts)", cache_dir, len(entries))
         return cls(cache_dir, entries)
 
-    def contains(self, prompt: str) -> bool:
-        return compute_prompt_key(prompt) in self.entries
-
     def _open_shard(self, shard_name: str) -> safe_open:
         if shard_name not in self._shard_handles:
             shard_path = os.path.join(self.cache_dir, shard_name)
@@ -96,7 +93,7 @@ class OfflineTextEmbedStore:
 
     def verify_coverage_or_raise(self, prompts: Sequence[str], *, context: str) -> None:
         """Raise if any prompt is missing from the store."""
-        missing = [prompt for prompt in prompts if not self.contains(prompt)]
+        missing = [prompt for prompt in prompts if compute_prompt_key(prompt) not in self.entries]
         require(
             not missing,
             f"Precomputed MiniMax-H3 text-embed coverage failed in {context}: "
@@ -162,9 +159,6 @@ class OfflineTextEmbedWriter:
                 )
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def contains(self, prompt: str) -> bool:
-        return compute_prompt_key(prompt) in self.entries
-
     def add(self, prompt: str, tensor: torch.Tensor) -> None:
         """Append one unpadded ``[L, D]`` embedding."""
         require(
@@ -216,9 +210,6 @@ class OfflineTextEmbedWriter:
 
 
 __all__ = [
-    "EXTRACTOR",
-    "FEATURE_DIM",
-    "INDEX_FILENAME",
     "OfflineTextEmbedStore",
     "OfflineTextEmbedWriter",
     "compute_prompt_key",

@@ -14,7 +14,7 @@ from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import MiniMaxH3PipelineConfig
 from .offline_text_embed import OfflineTextEmbedStore
-from .text_embed import truncate_minimax_h3_text_encoder
+from .text_embed import load_minimax_h3_conditioner
 from .vendor import (
     AutoencoderKLMiniMaxH3,
     AutoencoderKLMiniMaxH3Audio,
@@ -59,8 +59,6 @@ class MiniMaxH3Bundle(Bundle):
     @classmethod
     def from_config(cls, config: MiniMaxH3PipelineConfig) -> "MiniMaxH3Bundle":
         """Load every MiniMax-H3 component from a HuggingFace checkpoint."""
-        from transformers import AutoProcessor, AutoTokenizer, Qwen3VLForConditionalGeneration
-
         path = config.pretrained_model_ckpt_path
         vae_path = config.vae_ckpt_path or path
         te_path = config.text_encoder_ckpt_path or path
@@ -121,26 +119,17 @@ class MiniMaxH3Bundle(Bundle):
 
         text_embed_store = OfflineTextEmbedStore.from_dir(cache_path) if cache_path is not None else None
 
-        # Conditioner -- Qwen3-VL-32B (frozen). H3 reads an intermediate hidden
-        # state from it, so it must be loaded as the full LM, not a truncated
-        # encoder; the layers past that state are then dropped. A populated
-        # text_embed_cache_path replaces that load.
+        # Conditioner -- Qwen3-VL-32B (frozen). A populated text_embed_cache_path
+        # replaces that load.
         if text_embed_store is not None:
             logging.getLogger(__name__).info(
                 "MiniMaxH3Bundle: text_embed_cache_path=%s, not loading the 32B Qwen3-VL conditioner",
                 cache_path,
             )
-            text_encoder = None
-            processor = None
-            tokenizer = None
+            text_encoder = processor = tokenizer = None
         else:
-            text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
-                te_path, subfolder="text_encoder", torch_dtype=te_dtype
-            )
-            text_encoder = truncate_minimax_h3_text_encoder(text_encoder).to(aux_device).eval()
-            text_encoder.requires_grad_(False)
-            processor = AutoProcessor.from_pretrained(te_path, subfolder="processor")
-            tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
+            text_encoder, processor, tokenizer = load_minimax_h3_conditioner(te_path, te_dtype)
+            text_encoder = text_encoder.to(aux_device)
 
         bundle = cls(
             transformer=transformer,

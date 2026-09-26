@@ -12,7 +12,7 @@ from collections import OrderedDict
 from contextlib import ExitStack, contextmanager
 from datetime import timedelta
 from functools import cache
-from typing import TYPE_CHECKING, Any, Iterator, List
+from typing import TYPE_CHECKING, Any, Iterator, List, Tuple
 
 import torch
 
@@ -50,6 +50,28 @@ def truncate_minimax_h3_text_encoder(text_encoder: torch.nn.Module) -> torch.nn.
     del decoder.layers[MINIMAX_H3_TEXT_ENCODER_LAYER:]
     decoder.norm = torch.nn.Identity()
     return text_encoder
+
+
+def load_minimax_h3_conditioner(
+    path: str, dtype: torch.dtype, *, nested: bool = True
+) -> Tuple[torch.nn.Module, Any, Any]:
+    """Load the frozen, truncated Qwen3-VL conditioner with its processor and tokenizer."""
+    from transformers import AutoProcessor, AutoTokenizer, Qwen3VLForConditionalGeneration
+
+    def subfolder(name: str) -> str | None:
+        if nested:
+            return name
+        return name if os.path.isdir(os.path.join(path, name)) else None
+
+    # H3 reads an intermediate hidden state, so this must be the full LM class,
+    # not a truncated encoder; the layers past that state are dropped after load.
+    text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+        path, subfolder=subfolder("text_encoder"), torch_dtype=dtype
+    )
+    text_encoder = truncate_minimax_h3_text_encoder(text_encoder).eval().requires_grad_(False)
+    processor = AutoProcessor.from_pretrained(path, subfolder=subfolder("processor"))
+    tokenizer = AutoTokenizer.from_pretrained(path, subfolder=subfolder("tokenizer"))
+    return text_encoder, processor, tokenizer
 
 
 @torch.no_grad()
@@ -247,4 +269,8 @@ class MiniMaxH3TextEmbedStage:
             yield
 
 
-__all__ = ["MiniMaxH3TextEmbedStage", "encode_minimax_h3_prompt", "truncate_minimax_h3_text_encoder"]
+__all__ = [
+    "MiniMaxH3TextEmbedStage",
+    "encode_minimax_h3_prompt",
+    "load_minimax_h3_conditioner",
+]

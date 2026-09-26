@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import time
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 
 from unirl.data.datasets import TextPromptDataset
-from unirl.models.minimax_h3.offline_text_embed import OfflineTextEmbedStore, OfflineTextEmbedWriter
-from unirl.models.minimax_h3.text_embed import encode_minimax_h3_prompt, truncate_minimax_h3_text_encoder
+from unirl.models.minimax_h3.offline_text_embed import (
+    OfflineTextEmbedStore,
+    OfflineTextEmbedWriter,
+    compute_prompt_key,
+)
+from unirl.models.minimax_h3.text_embed import encode_minimax_h3_prompt, load_minimax_h3_conditioner
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger("unirl.tools.precompute_minimax_h3")
@@ -59,22 +62,6 @@ def _load_prompts(data_paths: List[str], prompt_key: str) -> List[str]:
     return list(dict.fromkeys(prompts))
 
 
-def _load_text_encoder(model_path: str, device: torch.device, dtype: torch.dtype) -> Tuple[torch.nn.Module, Any, Any]:
-    from transformers import AutoProcessor, AutoTokenizer, Qwen3VLForConditionalGeneration
-
-    def subfolder(name: str) -> Optional[str]:
-        """Diffusers checkpoints nest each component; a bare Qwen3-VL repo does not."""
-        return name if os.path.isdir(os.path.join(model_path, name)) else None
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path, subfolder=subfolder("tokenizer"))
-    processor = AutoProcessor.from_pretrained(model_path, subfolder=subfolder("processor"))
-    encoder = Qwen3VLForConditionalGeneration.from_pretrained(
-        model_path, subfolder=subfolder("text_encoder"), torch_dtype=dtype
-    )
-    encoder = truncate_minimax_h3_text_encoder(encoder).to(device).eval().requires_grad_(False)
-    return encoder, tokenizer, processor
-
-
 def run_precomputation(args: argparse.Namespace) -> None:
     prompts = _load_prompts(args.data_path, args.prompt_key)
     sources = ", ".join(args.data_path)
@@ -93,7 +80,7 @@ def run_precomputation(args: argparse.Namespace) -> None:
         resume=args.resume,
         force_overwrite=args.force_overwrite,
     )
-    needed = [prompt for prompt in prompts if not writer.contains(prompt)]
+    needed = [prompt for prompt in prompts if compute_prompt_key(prompt) not in writer.entries]
     logger.info("Need embeddings for %d/%d prompts", len(needed), len(prompts))
     if not needed and not args.check_parity:
         writer.close()
@@ -101,7 +88,8 @@ def run_precomputation(args: argparse.Namespace) -> None:
 
     device = torch.device(args.device)
     dtype = parse_torch_dtype(args.dtype, field_name="precompute.dtype")
-    text_encoder, tokenizer, processor = _load_text_encoder(args.model_path, device, dtype)
+    text_encoder, processor, tokenizer = load_minimax_h3_conditioner(args.model_path, dtype, nested=False)
+    text_encoder = text_encoder.to(device)
 
     def extract(prompt: str) -> torch.Tensor:
         hidden = encode_minimax_h3_prompt(
