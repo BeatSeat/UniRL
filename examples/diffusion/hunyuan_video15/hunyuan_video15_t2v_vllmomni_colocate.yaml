@@ -54,6 +54,7 @@ bundle:
     _target_: unirl.models.hunyuan_video15.config.HunyuanVideo15PipelineConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v}
     model_precision: bf16
+    attention_backend: flash_varlen
     shift: 5.0
     load_vae: false
 
@@ -128,6 +129,8 @@ rollout:
     omni_extra:
       init_timeout: 3600
       stage_init_timeout: 1800
+      # Overrides the deploy config's TORCH_SDPA; keep paired with bundle.config.attention_backend.
+      diffusion_attention_backend: FLASH_ATTN
       # Reuse text-encoder outputs across GRPO siblings; size >= distinct prompts in flight per worker.
       # enable_prompt_embed_cache: true
       # prompt_embed_cache_size: 32

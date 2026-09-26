@@ -23,6 +23,13 @@ uv venv --python 3.12 --seed .venv && source .venv/bin/activate
 uv pip install -e ".[vllm,train,infer]"
 ```
 
+To use a Diffusers FlashAttention backend (for example `flash_varlen`) in
+diffusion training:
+
+```bash
+MAX_JOBS=8 uv pip install -e ".[flash-attn]" --no-build-isolation
+```
+
 ## sglang
 
 ```bash
@@ -55,6 +62,7 @@ uv pip install -e ".[sglang,train,infer]"
 | Extra | Adds | Use when |
 |---|---|---|
 | `vllm` | `vllm`, `vllm-omni`, torch +cu130 stack, PyAV | vLLM and vLLM-Omni recipes |
+| `flash-attn` | FlashAttention 2 | Diffusers `flash*` attention backends in diffusion training |
 | `sglang` | `sglang[diffusion]`, `checkpoint-engine`, `flash-attn-4`, `flash-linear-attention[conv1d]`, torch +cu130 stack, PyAV | SGLang-based AR/VLM and diffusion recipes |
 | `fastvideo` | FastVideo pinned to an upstream Git commit | WAN 2.1 / 2.2 rollout; [the extra does not currently resolve](#fastvideo-installation-blocker) |
 | `train` | `wandb`, `aiohttp`, `math-verify` | Training runs and local math-answer scoring |
