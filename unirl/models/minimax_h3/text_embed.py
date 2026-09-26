@@ -23,29 +23,6 @@ from unirl.utils.run_id import resolve_run_id
 
 from .vendor import MINIMAX_H3_TEXT_ENCODER_LAYER
 
-
-def encode_minimax_h3_prompt(
-    *,
-    text_encoder: torch.nn.Module,
-    tokenizer: Any,
-    processor: Any,
-    prompt: str,
-    device: torch.device,
-) -> torch.Tensor:
-    """Return layer-50 hidden states ``[1, L, D]`` for one prompt."""
-    token_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-    input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
-    mm_token_type_ids = torch.tensor(processor.create_mm_token_type_ids([token_ids]), dtype=torch.long, device=device)
-    outputs = text_encoder.model(
-        input_ids=input_ids,
-        attention_mask=torch.ones_like(input_ids),
-        mm_token_type_ids=mm_token_type_ids,
-        use_cache=False,
-        output_hidden_states=True,
-    )
-    return outputs.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER]
-
-
 if TYPE_CHECKING:
     from .bundle import MiniMaxH3Bundle
 
@@ -54,6 +31,50 @@ _EMBED_SYNC_TIMEOUT = timedelta(minutes=30)
 # One entry is [1, tokens, hidden] in the encoder's own dtype — a few MB for a
 # typical prompt, so this bounds the CPU-resident cache at a few hundred MB.
 _PROMPT_CACHE_SIZE = 64
+
+
+def truncate_minimax_h3_text_encoder(text_encoder: torch.nn.Module) -> torch.nn.Module:
+    """Cut the Qwen3-VL decoder back to the layer MiniMax-H3 conditions on."""
+    model = text_encoder.model
+    decoder = getattr(model, "language_model", model)
+    num_layers = len(decoder.layers)
+    require(
+        num_layers > MINIMAX_H3_TEXT_ENCODER_LAYER,
+        f"truncate_minimax_h3_text_encoder: MiniMax-H3 conditions on hidden_states[{MINIMAX_H3_TEXT_ENCODER_LAYER}] of "
+        f"its Qwen3-VL conditioner, which needs more than {MINIMAX_H3_TEXT_ENCODER_LAYER} decoder layers, but "
+        f"the loaded conditioner has {num_layers}.",
+    )
+    # hidden_states[i] is decoder layer i's raw output, except that transformers
+    # swaps the LAST entry for the normed last_hidden_state. Dropping the final
+    # norm with the tail makes last_hidden_state exactly the old hidden_states[50].
+    del decoder.layers[MINIMAX_H3_TEXT_ENCODER_LAYER:]
+    decoder.norm = torch.nn.Identity()
+    return text_encoder
+
+
+@torch.no_grad()
+def encode_minimax_h3_prompt(
+    *,
+    text_encoder: torch.nn.Module,
+    tokenizer: Any,
+    processor: Any,
+    prompt: str,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return layer-50 hidden states ``[1, L, D]`` from a truncated conditioner."""
+    token_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
+    # Qwen3-VL lays its 3D rotary positions out per modality run, read off the
+    # token type ids the processor derives (0 text, 1 image, 2 video).
+    # Text-only here, but the conditioner still wants them.
+    mm_token_type_ids = torch.tensor(processor.create_mm_token_type_ids([token_ids]), dtype=torch.long, device=device)
+    outputs = text_encoder.model(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        mm_token_type_ids=mm_token_type_ids,
+        use_cache=False,
+    )
+    return outputs.last_hidden_state
 
 
 @cache
@@ -101,15 +122,7 @@ class MiniMaxH3TextEmbedStage:
 
     @property
     def _encoder_device(self) -> torch.device:
-        require(self.text_encoder is not None, "MiniMaxH3TextEmbedStage: text_encoder is not loaded")
         return next(self.text_encoder.parameters()).device
-
-    @property
-    def _decoder(self):
-        """The decoder stack that owns ``.layers``."""
-        require(self.text_encoder is not None, "MiniMaxH3TextEmbedStage: text_encoder is not loaded")
-        model = self.text_encoder.model
-        return getattr(model, "language_model", model)
 
     def _pack_embeds(self, embeds: List[torch.Tensor]) -> TextEmbedCondition:
         lengths = {int(tensor.shape[1]) for tensor in embeds}
@@ -142,14 +155,6 @@ class MiniMaxH3TextEmbedStage:
             "MiniMaxH3TextEmbedStage: text_encoder is not loaded and text_embed_cache_path is unset.",
         )
 
-        num_layers = len(self._decoder.layers)
-        require(
-            num_layers > MINIMAX_H3_TEXT_ENCODER_LAYER,
-            f"MiniMaxH3TextEmbedStage: MiniMax-H3 conditions on hidden_states[{MINIMAX_H3_TEXT_ENCODER_LAYER}] of "
-            f"its Qwen3-VL conditioner, which needs more than {MINIMAX_H3_TEXT_ENCODER_LAYER} decoder layers, but "
-            f"the loaded conditioner has {num_layers}.",
-        )
-
         self._ensure_embedding_sync_group()
         unique_prompts = list(dict.fromkeys(prompts))
         resolved = {prompt: self._cache[prompt] for prompt in unique_prompts if prompt in self._cache}
@@ -159,7 +164,13 @@ class MiniMaxH3TextEmbedStage:
             with self._embedding_residency():
                 encoder_device = self._encoder_device
                 for prompt in missing:
-                    cached = self._encode_prompt(prompt, encoder_device).detach().to("cpu").contiguous()
+                    cached = encode_minimax_h3_prompt(
+                        text_encoder=self.text_encoder,
+                        tokenizer=self.tokenizer,
+                        processor=self.processor,
+                        prompt=prompt,
+                        device=encoder_device,
+                    ).to("cpu")
                     resolved[prompt] = cached
                     self._cache[prompt] = cached
                     if len(self._cache) > _PROMPT_CACHE_SIZE:
@@ -207,16 +218,6 @@ class MiniMaxH3TextEmbedStage:
             wait_all_ranks=True,
         )
 
-    def _encode_prompt(self, prompt: str, encoder_device: torch.device) -> torch.Tensor:
-        """Run the frozen Qwen3-VL conditioner once for one prompt."""
-        return encode_minimax_h3_prompt(
-            text_encoder=self.text_encoder,
-            tokenizer=self.tokenizer,
-            processor=self.processor,
-            prompt=prompt,
-            device=encoder_device,
-        )
-
     @contextmanager
     def _embedding_residency(self) -> Iterator[None]:
         """Temporarily exchange GPU-resident VAEs for the frozen text encoder."""
@@ -246,4 +247,4 @@ class MiniMaxH3TextEmbedStage:
             yield
 
 
-__all__ = ["MiniMaxH3TextEmbedStage", "encode_minimax_h3_prompt"]
+__all__ = ["MiniMaxH3TextEmbedStage", "encode_minimax_h3_prompt", "truncate_minimax_h3_text_encoder"]

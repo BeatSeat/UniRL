@@ -14,6 +14,7 @@ from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import MiniMaxH3PipelineConfig
 from .offline_text_embed import OfflineTextEmbedStore
+from .text_embed import truncate_minimax_h3_text_encoder
 from .vendor import (
     AutoencoderKLMiniMaxH3,
     AutoencoderKLMiniMaxH3Audio,
@@ -122,7 +123,8 @@ class MiniMaxH3Bundle(Bundle):
 
         # Conditioner -- Qwen3-VL-32B (frozen). H3 reads an intermediate hidden
         # state from it, so it must be loaded as the full LM, not a truncated
-        # encoder. A populated text_embed_cache_path replaces that load.
+        # encoder; the layers past that state are then dropped. A populated
+        # text_embed_cache_path replaces that load.
         if text_embed_store is not None:
             logging.getLogger(__name__).info(
                 "MiniMaxH3Bundle: text_embed_cache_path=%s, not loading the 32B Qwen3-VL conditioner",
@@ -135,7 +137,7 @@ class MiniMaxH3Bundle(Bundle):
             text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
                 te_path, subfolder="text_encoder", torch_dtype=te_dtype
             )
-            text_encoder = text_encoder.to(aux_device).eval()
+            text_encoder = truncate_minimax_h3_text_encoder(text_encoder).to(aux_device).eval()
             text_encoder.requires_grad_(False)
             processor = AutoProcessor.from_pretrained(te_path, subfolder="processor")
             tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")

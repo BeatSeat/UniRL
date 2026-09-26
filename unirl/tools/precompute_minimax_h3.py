@@ -6,13 +6,13 @@ import argparse
 import logging
 import os
 import time
-from typing import List, Optional
+from typing import Any, List, Optional, Tuple
 
 import torch
 
 from unirl.data.datasets import TextPromptDataset
 from unirl.models.minimax_h3.offline_text_embed import OfflineTextEmbedStore, OfflineTextEmbedWriter
-from unirl.models.minimax_h3.text_embed import encode_minimax_h3_prompt
+from unirl.models.minimax_h3.text_embed import encode_minimax_h3_prompt, truncate_minimax_h3_text_encoder
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger("unirl.tools.precompute_minimax_h3")
@@ -59,28 +59,29 @@ def _load_prompts(data_paths: List[str], prompt_key: str) -> List[str]:
     return list(dict.fromkeys(prompts))
 
 
-def _load_text_encoder(model_path: str, device: torch.device, dtype: torch.dtype):
+def _load_text_encoder(model_path: str, device: torch.device, dtype: torch.dtype) -> Tuple[torch.nn.Module, Any, Any]:
     from transformers import AutoProcessor, AutoTokenizer, Qwen3VLForConditionalGeneration
 
-    subfolder = "text_encoder" if os.path.isdir(os.path.join(model_path, "text_encoder")) else None
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, subfolder="tokenizer" if os.path.isdir(os.path.join(model_path, "tokenizer")) else None
+    def subfolder(name: str) -> Optional[str]:
+        """Diffusers checkpoints nest each component; a bare Qwen3-VL repo does not."""
+        return name if os.path.isdir(os.path.join(model_path, name)) else None
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, subfolder=subfolder("tokenizer"))
+    processor = AutoProcessor.from_pretrained(model_path, subfolder=subfolder("processor"))
+    encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+        model_path, subfolder=subfolder("text_encoder"), torch_dtype=dtype
     )
-    processor = AutoProcessor.from_pretrained(
-        model_path, subfolder="processor" if os.path.isdir(os.path.join(model_path, "processor")) else None
-    )
-    encoder = Qwen3VLForConditionalGeneration.from_pretrained(model_path, subfolder=subfolder, torch_dtype=dtype)
-    return encoder.to(device).eval().requires_grad_(False), tokenizer, processor
+    encoder = truncate_minimax_h3_text_encoder(encoder).to(device).eval().requires_grad_(False)
+    return encoder, tokenizer, processor
 
 
 def run_precomputation(args: argparse.Namespace) -> None:
     prompts = _load_prompts(args.data_path, args.prompt_key)
-    logger.info("Loaded %d prompts from %s", len(prompts), ", ".join(args.data_path))
+    sources = ", ".join(args.data_path)
+    logger.info("Loaded %d prompts from %s", len(prompts), sources)
 
     if args.check_coverage:
-        OfflineTextEmbedStore.from_dir(args.output_dir).verify_coverage_or_raise(
-            prompts, context=", ".join(args.data_path)
-        )
+        OfflineTextEmbedStore.from_dir(args.output_dir).verify_coverage_or_raise(prompts, context=sources)
         logger.info("Coverage OK: %d prompts in %s", len(prompts), args.output_dir)
         return
 
@@ -109,30 +110,30 @@ def run_precomputation(args: argparse.Namespace) -> None:
         return hidden.squeeze(0).to("cpu", dtype=dtype)
 
     started = time.perf_counter()
-    for idx, prompt in enumerate(needed):
-        writer.add(prompt, extract(prompt))
-        if (idx + 1) % 100 == 0 or (idx + 1) == len(needed):
-            elapsed = time.perf_counter() - started
-            rate = (idx + 1) / elapsed if elapsed else 0.0
-            logger.info("Processed %d/%d prompts (%.1f prompts/s)", idx + 1, len(needed), rate)
-    writer.close()
+    # close() in finally flushes the partial shard, so --resume after a crash
+    # restarts from the last encoded prompt rather than the last full shard.
+    try:
+        for idx, prompt in enumerate(needed):
+            writer.add(prompt, extract(prompt))
+            if (idx + 1) % 100 == 0 or (idx + 1) == len(needed):
+                elapsed = time.perf_counter() - started
+                rate = (idx + 1) / elapsed if elapsed else 0.0
+                logger.info("Processed %d/%d prompts (%.1f prompts/s)", idx + 1, len(needed), rate)
+    finally:
+        writer.close()
 
     if not args.check_parity:
         return
     store = OfflineTextEmbedStore.from_dir(args.output_dir)
-    peak = 0.0
-    failed = False
-    for prompt in prompts[: args.parity_samples]:
-        cached = store.get(prompt).float()
-        live = extract(prompt).float()
-        diff = (cached - live).abs().max().item()
-        peak = max(peak, diff)
+    samples = prompts[: args.parity_samples]
+    failed = {}
+    for prompt in samples:
+        cached, live = store.get(prompt).float(), extract(prompt).float()
         if not torch.allclose(cached, live, atol=args.parity_atol, rtol=args.parity_rtol):
-            logger.error("Parity FAILED for %r (max diff %.6e)", prompt, diff)
-            failed = True
+            failed[prompt] = (cached - live).abs().max().item()
     if failed:
-        raise RuntimeError(f"Numerical parity check failed; peak abs diff {peak:.6e}")
-    logger.info("Parity PASSED; peak abs diff %.6e", peak)
+        raise RuntimeError(f"Numerical parity check failed; max abs diff per prompt: {failed}")
+    logger.info("Parity PASSED for %d prompts", len(samples))
 
 
 def main() -> None:
