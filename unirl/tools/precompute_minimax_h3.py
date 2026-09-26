@@ -15,7 +15,6 @@ from unirl.models.minimax_h3.offline_text_embed import OfflineTextEmbedStore, Of
 from unirl.models.minimax_h3.text_embed import encode_minimax_h3_prompt
 from unirl.utils.dtypes import parse_torch_dtype
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("unirl.tools.precompute_minimax_h3")
 
 
@@ -36,7 +35,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--force-overwrite", action="store_true")
     parser.add_argument("--check-coverage", action="store_true")
-    parser.add_argument("--check-parity", action="store_true")
+    parser.add_argument(
+        "--check-parity",
+        action="store_true",
+        help="Re-encode the first --parity-samples prompts with this run's encoder, device, and dtype and compare "
+        "them with the stored tensors. This checks the write/read round trip, not the trainside encoder config.",
+    )
     parser.add_argument("--parity-samples", type=int, default=5)
     parser.add_argument("--parity-atol", type=float, default=1e-3)
     parser.add_argument("--parity-rtol", type=float, default=1e-3)
@@ -88,7 +92,7 @@ def run_precomputation(args: argparse.Namespace) -> None:
         resume=args.resume,
         force_overwrite=args.force_overwrite,
     )
-    needed = [prompt for prompt in prompts if not writer.contains(prompt)] if args.resume else list(prompts)
+    needed = [prompt for prompt in prompts if not writer.contains(prompt)]
     logger.info("Need embeddings for %d/%d prompts", len(needed), len(prompts))
     if not needed and not args.check_parity:
         writer.close()
@@ -102,7 +106,7 @@ def run_precomputation(args: argparse.Namespace) -> None:
         hidden = encode_minimax_h3_prompt(
             text_encoder=text_encoder, tokenizer=tokenizer, processor=processor, prompt=prompt, device=device
         )
-        return hidden.squeeze(0).detach().to("cpu", dtype=dtype).contiguous()
+        return hidden.squeeze(0).to("cpu", dtype=dtype)
 
     started = time.perf_counter()
     for idx, prompt in enumerate(needed):
@@ -119,7 +123,7 @@ def run_precomputation(args: argparse.Namespace) -> None:
     peak = 0.0
     failed = False
     for prompt in prompts[: args.parity_samples]:
-        cached = store.get(prompt).embeds.squeeze(0).float()
+        cached = store.get(prompt).float()
         live = extract(prompt).float()
         diff = (cached - live).abs().max().item()
         peak = max(peak, diff)
@@ -132,6 +136,7 @@ def run_precomputation(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     run_precomputation(parse_args())
 
 

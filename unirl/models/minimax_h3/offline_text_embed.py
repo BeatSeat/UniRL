@@ -13,7 +13,8 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from unirl.config.require import require
-from unirl.types.conditions import TextEmbedCondition
+
+from .vendor import MINIMAX_H3_TEXT_ENCODER_LAYER
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +22,22 @@ INDEX_FILENAME = "index.json"
 SCHEMA_VERSION = "1.0"
 EXTRACTOR = "minimax_h3_text_embed"
 FEATURE_DIM = 5120
-TARGET_LAYER = 50
+_STORE_FINGERPRINT: Dict[str, Any] = {
+    "schema_version": SCHEMA_VERSION,
+    "extractor": EXTRACTOR,
+    "target_layer": MINIMAX_H3_TEXT_ENCODER_LAYER,
+    "feature_dim": FEATURE_DIM,
+}
 
 
 def compute_prompt_key(prompt: str) -> str:
-    """Return a 16-hex SHA-256 fingerprint of the stripped prompt."""
-    return hashlib.sha256(prompt.strip().encode("utf-8")).hexdigest()[:16]
+    """Return a 16-hex SHA-256 fingerprint of the exact prompt string."""
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
+
+
+def _require_fingerprint(index_data: Dict[str, Any], expected: Dict[str, Any], message: str) -> None:
+    mismatched = {key: (index_data.get(key), value) for key, value in expected.items() if index_data.get(key) != value}
+    require(not mismatched, f"{message}: {{field: (stored, expected)}} = {mismatched}")
 
 
 class OfflineTextEmbedStore:
@@ -51,10 +62,8 @@ class OfflineTextEmbedStore:
         )
         with open(index_path, "r", encoding="utf-8") as handle:
             index_data = json.load(handle)
-        extractor = index_data.get("extractor")
-        require(
-            extractor == EXTRACTOR,
-            f"OfflineTextEmbedStore: extractor {extractor!r} != {EXTRACTOR!r} at {cache_dir}",
+        _require_fingerprint(
+            index_data, _STORE_FINGERPRINT, f"OfflineTextEmbedStore: fingerprint mismatch at {index_path}"
         )
         entries = {key: str(shard) for key, shard in index_data["entries"].items()}
         logger.info("Loaded MiniMax-H3 text-embed store from %s (%d prompts)", cache_dir, len(entries))
@@ -70,8 +79,8 @@ class OfflineTextEmbedStore:
             self._shard_handles[shard_name] = safe_open(shard_path, framework="pt", device="cpu")
         return self._shard_handles[shard_name]
 
-    def get(self, prompt: str) -> TextEmbedCondition:
-        """Fetch one prompt's unpadded embedding as batch-1 ``[1, L, D]``."""
+    def get(self, prompt: str) -> torch.Tensor:
+        """Fetch one prompt's unpadded ``[L, D]`` embedding."""
         key = compute_prompt_key(prompt)
         require(
             key in self.entries,
@@ -83,11 +92,7 @@ class OfflineTextEmbedStore:
         require(key in shard.keys(), f"OfflineTextEmbedStore: key {key} missing from shard {shard_name}")
         tensor = shard.get_tensor(key)
         require(tensor.dim() == 2, f"OfflineTextEmbedStore: expected [L, D], got {tuple(tensor.shape)}")
-        embeds = tensor.unsqueeze(0)
-        return TextEmbedCondition(
-            embeds=embeds,
-            attn_mask=torch.ones((1, embeds.shape[1]), dtype=torch.bool, device=embeds.device),
-        )
+        return tensor
 
     def verify_coverage_or_raise(self, prompts: Sequence[str], *, context: str = "") -> None:
         """Raise if any prompt is missing from the store."""
@@ -119,7 +124,6 @@ class OfflineTextEmbedWriter:
         self.model_checkpoint = model_checkpoint
         self.dtype = dtype
         self.shard_size = shard_size
-        self.resume = resume
         self.entries: Dict[str, str] = {}
         self.shards: List[str] = []
         self._current_shard_tensors: Dict[str, torch.Tensor] = {}
@@ -141,11 +145,11 @@ class OfflineTextEmbedWriter:
             elif resume:
                 with open(index_path, "r", encoding="utf-8") as handle:
                     data = json.load(handle)
-                if data.get("extractor") != EXTRACTOR or int(data.get("feature_dim", 0)) != FEATURE_DIM:
-                    raise ValueError(
-                        f"OfflineTextEmbedWriter: fingerprint mismatch at {index_path} "
-                        f"(extractor={data.get('extractor')}, dim={data.get('feature_dim')}). Use --force-overwrite."
-                    )
+                _require_fingerprint(
+                    data,
+                    {**_STORE_FINGERPRINT, "model_checkpoint": self.model_checkpoint, "dtype": self.dtype},
+                    f"OfflineTextEmbedWriter: cannot resume {index_path}; use --force-overwrite to rebuild",
+                )
                 self.entries = {key: str(shard) for key, shard in data.get("entries", {}).items()}
                 self.shards = list(data.get("shards", []))
                 self._current_shard_idx = len(self.shards)
@@ -162,13 +166,9 @@ class OfflineTextEmbedWriter:
         return compute_prompt_key(prompt) in self.entries
 
     def add(self, prompt: str, tensor: torch.Tensor) -> None:
-        """Append one unpadded ``[L, D]`` (or ``[1, L, D]``) embedding."""
+        """Append one unpadded ``[L, D]`` embedding."""
         key = compute_prompt_key(prompt)
-        if self.resume and key in self.entries:
-            return
         value = tensor.detach().to("cpu").contiguous()
-        if value.dim() == 3 and value.shape[0] == 1:
-            value = value.squeeze(0)
         require(value.dim() == 2, f"OfflineTextEmbedWriter: expected [L, D], got {tuple(value.shape)}")
         require(
             int(value.shape[1]) == FEATURE_DIM,
@@ -195,11 +195,8 @@ class OfflineTextEmbedWriter:
 
     def _save_index(self) -> None:
         index_data = {
-            "schema_version": SCHEMA_VERSION,
-            "extractor": EXTRACTOR,
+            **_STORE_FINGERPRINT,
             "model_checkpoint": self.model_checkpoint,
-            "target_layer": TARGET_LAYER,
-            "feature_dim": FEATURE_DIM,
             "dtype": self.dtype,
             "total_prompts": len(self.entries),
             "shards": self.shards,
@@ -224,7 +221,6 @@ __all__ = [
     "EXTRACTOR",
     "FEATURE_DIM",
     "INDEX_FILENAME",
-    "TARGET_LAYER",
     "OfflineTextEmbedStore",
     "OfflineTextEmbedWriter",
     "compute_prompt_key",

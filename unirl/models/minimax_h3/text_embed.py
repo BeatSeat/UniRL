@@ -134,12 +134,9 @@ class MiniMaxH3TextEmbedStage:
         prompts: List[str] = list(texts.texts)
         require(len(prompts) > 0, "MiniMaxH3TextEmbedStage: no prompts to embed")
         if self._store is not None:
-            pieces = []
-            for prompt in prompts:
-                embeds = self._store.get(prompt).embeds
-                require(embeds is not None, f"MiniMaxH3TextEmbedStage: empty cache entry for {prompt!r}")
-                pieces.append(embeds.to(device=self.device, dtype=self.dtype))
-            return self._pack_embeds(pieces)
+            return self._pack_embeds(
+                [self._store.get(prompt).unsqueeze(0).to(device=self.device, dtype=self.dtype) for prompt in prompts]
+            )
         require(
             self.text_encoder is not None,
             "MiniMaxH3TextEmbedStage: text_encoder is not loaded and text_embed_cache_path is unset.",

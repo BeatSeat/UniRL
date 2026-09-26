@@ -30,14 +30,14 @@ class MiniMaxH3Bundle(Bundle):
         transformer: nn.Module,
         vae: nn.Module,
         audio_vae: nn.Module,
-        text_encoder: Optional[nn.Module] = None,
-        processor: Optional[Any] = None,
-        tokenizer: Optional[Any] = None,
+        text_encoder: Optional[nn.Module],
+        processor: Optional[Any],
+        tokenizer: Optional[Any],
         dtype: torch.dtype,
         device: torch.device,
         pretrained_path: str,
-        text_encoder_onload_for_embed: bool = False,
-        text_embed_store: Optional[OfflineTextEmbedStore] = None,
+        text_encoder_onload_for_embed: bool,
+        text_embed_store: Optional[OfflineTextEmbedStore],
     ) -> None:
         super().__init__()
         self.transformer = transformer
@@ -63,7 +63,7 @@ class MiniMaxH3Bundle(Bundle):
         path = config.pretrained_model_ckpt_path
         vae_path = config.vae_ckpt_path or path
         te_path = config.text_encoder_ckpt_path or path
-        cache_path = (config.text_embed_cache_path or "").strip() or None
+        cache_path = config.text_embed_cache_path
 
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
