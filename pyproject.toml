@@ -94,6 +94,9 @@ vllm = [
   # leaves it unpinned instead of installing an otherwise optional dependency.
   "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
+flash-attn = [
+  "flash-attn>=2.6.3 ; sys_platform == 'linux'",
+]
 # Exact upstream source snapshot that the fail-closed FastVideo patch package is
 # verified against. This is hao-ai-lab/FastVideo PR #1222's source commit, not
 # Zcchill/FastVideo's UniRL-modified fork; UniRL re-hosts the required RL
