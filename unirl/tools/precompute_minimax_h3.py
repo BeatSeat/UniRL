@@ -22,7 +22,12 @@ logger = logging.getLogger("unirl.tools.precompute_minimax_h3")
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Precompute MiniMax-H3 text embeddings (Qwen3-VL layer 50).")
     parser.add_argument("--model-path", help="MiniMax-H3 checkpoint or text_encoder repo.")
-    parser.add_argument("--data-path", required=True, help="Prompt file (.jsonl, .json, or .txt).")
+    parser.add_argument(
+        "--data-path",
+        required=True,
+        nargs="+",
+        help="Prompt files (.jsonl, .json, or .txt); pass every split the run reads, eval included.",
+    )
     parser.add_argument("--output-dir", required=True, help="Directory for index.json and safetensors shards.")
     parser.add_argument("--prompt-key", default="prompt")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -41,8 +46,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return args
 
 
-def _load_prompts(data_path: str, prompt_key: str) -> List[str]:
-    return [item["prompt"] for item in TextPromptDataset(file_path=data_path, prompt_key=prompt_key).samples]
+def _load_prompts(data_paths: List[str], prompt_key: str) -> List[str]:
+    prompts = (
+        item["prompt"]
+        for data_path in data_paths
+        for item in TextPromptDataset(file_path=data_path, prompt_key=prompt_key).samples
+    )
+    return list(dict.fromkeys(prompts))
 
 
 def _load_text_encoder(model_path: str, device: torch.device, dtype: torch.dtype):
@@ -61,10 +71,12 @@ def _load_text_encoder(model_path: str, device: torch.device, dtype: torch.dtype
 
 def run_precomputation(args: argparse.Namespace) -> None:
     prompts = _load_prompts(args.data_path, args.prompt_key)
-    logger.info("Loaded %d prompts from %s", len(prompts), args.data_path)
+    logger.info("Loaded %d prompts from %s", len(prompts), ", ".join(args.data_path))
 
     if args.check_coverage:
-        OfflineTextEmbedStore.from_dir(args.output_dir).verify_coverage_or_raise(prompts, context=args.data_path)
+        OfflineTextEmbedStore.from_dir(args.output_dir).verify_coverage_or_raise(
+            prompts, context=", ".join(args.data_path)
+        )
         logger.info("Coverage OK: %d prompts in %s", len(prompts), args.output_dir)
         return
 

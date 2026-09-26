@@ -6,10 +6,11 @@ import hashlib
 import json
 import logging
 import os
-from typing import Dict, List, Sequence
+from typing import Any, Dict, List, Sequence
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 from unirl.config.require import require
 from unirl.types.conditions import TextEmbedCondition
@@ -34,7 +35,9 @@ class OfflineTextEmbedStore:
     def __init__(self, cache_dir: str, entries: Dict[str, str]) -> None:
         self.cache_dir = os.path.abspath(cache_dir)
         self.entries = entries
-        self._shard_cache: Dict[str, Dict[str, torch.Tensor]] = {}
+        # mmap handles, not materialized shards: a shard holds ~2000 [L, 5120]
+        # tensors, and every DP rank on a node would otherwise keep its own copy.
+        self._shard_handles: Dict[str, Any] = {}
 
     @classmethod
     def from_dir(cls, cache_dir: str) -> "OfflineTextEmbedStore":
@@ -60,12 +63,12 @@ class OfflineTextEmbedStore:
     def contains(self, prompt: str) -> bool:
         return compute_prompt_key(prompt) in self.entries
 
-    def _load_shard(self, shard_name: str) -> Dict[str, torch.Tensor]:
-        if shard_name not in self._shard_cache:
+    def _open_shard(self, shard_name: str) -> Any:
+        if shard_name not in self._shard_handles:
             shard_path = os.path.join(self.cache_dir, shard_name)
             require(os.path.isfile(shard_path), f"OfflineTextEmbedStore: missing shard: {shard_path}")
-            self._shard_cache[shard_name] = load_file(shard_path, device="cpu")
-        return self._shard_cache[shard_name]
+            self._shard_handles[shard_name] = safe_open(shard_path, framework="pt", device="cpu")
+        return self._shard_handles[shard_name]
 
     def get(self, prompt: str) -> TextEmbedCondition:
         """Fetch one prompt's unpadded embedding as batch-1 ``[1, L, D]``."""
@@ -73,12 +76,12 @@ class OfflineTextEmbedStore:
         require(
             key in self.entries,
             f"OfflineTextEmbedStore: prompt not in cache: {prompt!r}. "
-            "Run `python -m unirl.tools.precompute_minimax_h3` over the training prompts.",
+            "Run `python -m unirl.tools.precompute_minimax_h3` over every prompt file the run reads, eval included.",
         )
         shard_name = self.entries[key]
-        shard = self._load_shard(shard_name)
-        require(key in shard, f"OfflineTextEmbedStore: key {key} missing from shard {shard_name}")
-        tensor = shard[key]
+        shard = self._open_shard(shard_name)
+        require(key in shard.keys(), f"OfflineTextEmbedStore: key {key} missing from shard {shard_name}")
+        tensor = shard.get_tensor(key)
         require(tensor.dim() == 2, f"OfflineTextEmbedStore: expected [L, D], got {tuple(tensor.shape)}")
         embeds = tensor.unsqueeze(0)
         return TextEmbedCondition(
